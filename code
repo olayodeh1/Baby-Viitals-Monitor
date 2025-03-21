@@ -1,0 +1,173 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include <MPU6050.h>
+#include <DHT.h>
+
+// Sensor Definitions
+#define DHTPIN 15 // Pin connected to DHT11 on ESP32 (adjust as necessary)
+#define DHTTYPE DHT11
+
+MAX30105 particleSensor;
+MPU6050 mpu;
+DHT dht(DHTPIN, DHTTYPE);
+
+#define MAX_BRIGHTNESS 255
+
+uint32_t irBuffer[100]; // Infrared LED sensor data
+uint32_t redBuffer[100]; // Red LED sensor data
+
+int32_t bufferLength; // Data length
+int32_t spo2; // SPO2 value
+int8_t validSPO2; // Indicator if SPO2 calculation is valid
+int32_t heartRate; // Heart rate value
+int8_t validHeartRate; // Indicator if heart rate calculation is valid
+
+byte pulseLED = 2; // GPIO pin for pulse LED on ESP32
+byte readLED = 4; // GPIO pin for read LED on ESP32
+
+// Thresholds for fall detection
+const float FALL_THRESHOLD = 1.8; // Adjust this value based on fall sensitivity
+
+// Variables for breathing rate calculation
+unsigned long lastBreathTime = 0;
+int breathCount = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(pulseLED, OUTPUT);
+  pinMode(readLED, OUTPUT);
+
+  // Initialize I2C on ESP32 (usually SDA on GPIO 21 and SCL on GPIO 22)
+  Wire.begin(21, 22);
+
+  // Initialize MAX30105 sensor
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println(F("MAX30105 was not found. Please check wiring/power."));
+    while (1);
+  }
+
+  // Sensor configuration for MAX30105
+  particleSensor.setup(60, 4, 2, 100, 411, 4096);
+  Serial.println(F("Starting measurements..."));
+
+  // Initialize MPU6050 sensor
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println(F("MPU6050 connection failed."));
+    while (1);
+  }
+
+  // Initialize DHT11 sensor
+  dht.begin();
+}
+
+void loop() {
+  bufferLength = 100; // Buffer length of 100 stores 4 seconds of samples at 25sps
+
+  // Read the first 100 samples and determine the signal range
+  for (byte i = 0; i < bufferLength; i++) {
+    while (particleSensor.available() == false)
+      particleSensor.check();
+
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample();
+
+    Serial.print(F("red="));
+    Serial.print(redBuffer[i], DEC);
+    Serial.print(F(", ir="));
+    Serial.println(irBuffer[i], DEC);
+  }
+
+  // Calculate heart rate and SpO2 after first 100 samples (first 4 seconds)
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+  // Continuously take samples, calculating heart rate and SpO2 every second
+  while (1) {
+    // Shift data and acquire 25 new samples for continuous measurement
+    for (byte i = 25; i < 100; i++) {
+      redBuffer[i - 25] = redBuffer[i];
+      irBuffer[i - 25] = irBuffer[i];
+    }
+
+    // Take 25 new samples before recalculating heart rate
+    for (byte i = 75; i < 100; i++) {
+      while (particleSensor.available() == false)
+        particleSensor.check();
+
+      digitalWrite(readLED, !digitalRead(readLED)); // Blink read LED with each data read
+
+      redBuffer[i] = particleSensor.getRed();
+      irBuffer[i] = particleSensor.getIR();
+      particleSensor.nextSample();
+
+      Serial.print(F("red="));
+      Serial.print(redBuffer[i], DEC);
+      Serial.print(F(", ir="));
+      Serial.print(irBuffer[i], DEC);
+      Serial.print(F(", HR="));
+      Serial.print(heartRate, DEC);
+      Serial.print(F(", HRvalid="));
+      Serial.print(validHeartRate, DEC);
+      Serial.print(F(", SPO2="));
+      Serial.print(spo2, DEC);
+      Serial.print(F(", SPO2Valid="));
+      Serial.println(validSPO2, DEC);
+    }
+
+    // Recalculate heart rate and SpO2 with new samples
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+    // Check fall, breathing rate, and temperature/humidity
+    checkFallAndBreathing();
+    checkTemperatureAndHumidity();
+  }
+}
+
+void checkFallAndBreathing() {
+  // Get acceleration data from MPU6050
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+
+  // Convert to g-force
+  float aX = ax / 16384.0;
+  float aY = ay / 16384.0;
+  float aZ = az / 16384.0;
+
+  // Calculate magnitude of the acceleration vector
+  float magnitude = sqrt(aX * aX + aY * aY + aZ * aZ);
+
+  // Check if magnitude exceeds fall threshold
+  if (magnitude > FALL_THRESHOLD) {
+    Serial.println("Fall detected!");
+  }
+
+  // Detect breathing based on periodic abdomen expansion (Z-axis acceleration)
+  if (aZ > 0.1) { // Adjust threshold as needed
+    unsigned long currentBreathTime = millis();
+    if (currentBreathTime - lastBreathTime > 2000) { // Min delay for new breath detection
+      lastBreathTime = currentBreathTime;
+      breathCount++;
+      Serial.print("Breath detected. Total breaths: ");
+      Serial.println(breathCount);
+    }
+  }
+}
+
+void checkTemperatureAndHumidity() {
+  // Read temperature and humidity from DHT11
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  // Check if readings are valid
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("Failed to read from DHT sensor!");
+  } else {
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.print("°C, Humidity: ");
+    Serial.print(humidity);
+    Serial.println("%");
+  }
+}
